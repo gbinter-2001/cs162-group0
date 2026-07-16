@@ -23,7 +23,7 @@
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
-static bool load(const char* file_name, void (**eip)(void), void** esp);
+static bool load(char *file_name, void (**eip)(void), void **esp);
 bool setup_thread(void (**eip)(void), void** esp);
 
 /* Initializes user programs in the system by ensuring the main
@@ -259,7 +259,7 @@ struct Elf32_Phdr {
 #define PF_W 2 /* Writable. */
 #define PF_R 4 /* Readable. */
 
-static bool setup_stack(void** esp);
+static bool setup_stack(void **esp, char **argv, int argc);
 static bool validate_segment(const struct Elf32_Phdr*, struct file*);
 static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t read_bytes,
                          uint32_t zero_bytes, bool writable);
@@ -268,7 +268,7 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
    Stores the executable's entry point into *EIP
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
-bool load(const char* file_name, void (**eip)(void), void** esp) {
+bool load(char *file_name, void (**eip)(void), void** esp) {
   struct thread* t = thread_current();
   struct Elf32_Ehdr ehdr;
   struct file* file = NULL;
@@ -283,7 +283,20 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   process_activate();
 
   /* Open executable file. */
-  file = filesys_open(file_name);
+  /*todo: tokenize file_name to get the process name and the arguments argv and argc so laater i can pass them to the stack*/
+  char *save_ptr;
+  char *token = strtok_r(file_name, " ", &save_ptr);
+  
+  int argc = 0;
+  char *argv[128];
+  
+  while (token != NULL) {
+      argv[argc++] = token;
+      token = strtok_r(NULL, " ", &save_ptr);
+  }
+  
+  argv[argc] = NULL;
+  file = filesys_open(argv[0]);
   if (file == NULL) {
     printf("load: %s: open failed\n", file_name);
     goto done;
@@ -348,7 +361,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
   }
 
   /* Set up stack. */
-  if (!setup_stack(esp))
+  if (!setup_stack(esp, argv, argc))
     goto done;
 
   /* Start address. */
@@ -465,15 +478,77 @@ static bool load_segment(struct file* file, off_t ofs, uint8_t* upage, uint32_t 
 
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
-static bool setup_stack(void** esp) {
+static bool setup_stack(void** esp, char** argv, int argc) {
   uint8_t* kpage;
   bool success = false;
 
   kpage = palloc_get_page(PAL_USER | PAL_ZERO);
   if (kpage != NULL) {
     success = install_page(((uint8_t*)PHYS_BASE) - PGSIZE, kpage, true);
-    if (success)
-      *esp = PHYS_BASE;
+    if (success){
+    *esp = PHYS_BASE;
+
+   char *user_argv[128];
+
+/* Copy argument strings onto the user stack, in reverse order. */
+for (int i = argc - 1; i >= 0; i--) {
+    size_t length = strlen(argv[i]) + 1; /* Include '\0'. */
+
+    *esp = (char *) *esp - length;
+    memcpy(*esp, argv[i], length);
+
+    /* Remember the new user-space address of this string. */
+    user_argv[i] = (char *) *esp;
+}
+
+/* Bytes still to be pushed after padding. */
+size_t metadata_size =
+    sizeof(char *)              /* argv[argc] = NULL */
+    + argc * sizeof(char *)     /* argv[0] ... argv[argc - 1] */
+    + sizeof(char **)           /* argv */
+    + sizeof(int)               /* argc */
+    + sizeof(void *);           /* fake return address */
+
+/*
+   Pintos 32-bit ABI expects ESP % 16 == 12 at program entry,
+   as though a 4-byte return address had been pushed by call.
+*/
+size_t final_without_padding =
+    ((uintptr_t) *esp - metadata_size) % 16;
+
+size_t padding =
+    (16 + final_without_padding - 12) % 16;
+
+/* Add zero-filled alignment padding. */
+*esp = (char *) *esp - padding;
+memset(*esp, 0, padding);
+
+/* Push argv[argc] = NULL. */
+*esp = (char *) *esp - sizeof(char *);
+*(char **) *esp = NULL;
+
+/* Push pointers to argument strings, in reverse order. */
+for (int i = argc - 1; i >= 0; i--) {
+    *esp = (char *) *esp - sizeof(char *);
+    *(char **) *esp = user_argv[i];
+}
+
+/* ESP currently points to argv[0]. */
+char **argv_user = (char **) *esp;
+
+/* Push argv. */
+*esp = (char *) *esp - sizeof(char **);
+*(char ***) *esp = argv_user;
+
+/* Push argc. */
+*esp = (char *) *esp - sizeof(int);
+*(int *) *esp = argc;
+
+/* Push fake return address. */
+*esp = (char *) *esp - sizeof(void *);
+*(void **) *esp = NULL;
+    
+    }
     else
       palloc_free_page(kpage);
   }
