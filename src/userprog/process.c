@@ -80,17 +80,23 @@ static void start_process(void* file_name_) {
   /* Allocate process control block */
   struct process* new_pcb = malloc(sizeof(struct process));
   success = pcb_success = new_pcb != NULL;
-
   /* Initialize process control block */
   if (success) {
     // Ensure that timer_interrupt() -> schedule() -> process_activate()
     // does not try to activate our uninitialized pagedir
     new_pcb->pagedir = NULL;
     t->pcb = new_pcb;
+    t->pcb->exit_status = -1;
 
     // Continue initializing the PCB as normal
     t->pcb->main_thread = t;
-    strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+    strlcpy(t->pcb->process_name,
+      file_name,
+      sizeof t->pcb->process_name);
+
+    char *space = strchr(t->pcb->process_name, ' ');
+    if (space != NULL)
+      *space = '\0';
   }
 
   /* Initialize interrupt frame and load executable. */
@@ -147,13 +153,16 @@ int process_wait(pid_t child_pid UNUSED) {
 void process_exit(void) {
   struct thread* cur = thread_current();
   uint32_t* pd;
+  
 
   /* If this thread does not have a PCB, don't worry */
   if (cur->pcb == NULL) {
     thread_exit();
     NOT_REACHED();
   }
-
+  printf("%s: exit(%d)\n",
+       cur->pcb->process_name,
+       cur->pcb->exit_status);
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pcb->pagedir;
