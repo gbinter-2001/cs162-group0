@@ -1,5 +1,6 @@
 #ifndef USERPROG_PROCESS_H
 #define USERPROG_PROCESS_H
+#include <stdbool.h>
 
 #include "threads/thread.h"
 #include <stdint.h>
@@ -28,8 +29,29 @@ struct process {
   char process_name[16];      /* Name of the main thread */
   struct thread* main_thread; /* Pointer to main thread */
   int exit_status;  
+  struct process_status* parent_status;
+  struct list children;
+
 
 };
+
+struct exec_info{
+    char* file_name;
+    bool load_success;
+    struct semaphore load_done;
+    struct process_status* process_status;
+};
+
+struct process_status{
+    pid_t pid;
+    int exit_status;
+    struct semaphore wait_done;
+    bool waited;
+    int ref_count;
+    struct list_elem elem;
+    struct lock ref_lock;
+};
+
 
 void userprog_init(void);
 
