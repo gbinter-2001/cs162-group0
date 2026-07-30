@@ -2,12 +2,15 @@
 #include <debug.h>
 #include "filesys/inode.h"
 #include "threads/malloc.h"
+#include "threads/synch.h"
 
 /* An open file. */
 struct file {
   struct inode* inode; /* File's inode. */
   off_t pos;           /* Current position. */
   bool deny_write;     /* Has file_deny_write() been called? */
+  int ref_count;
+  struct lock ref_lock;
 };
 
 /* Opens a file for the given INODE, of which it takes ownership,
@@ -19,6 +22,8 @@ struct file* file_open(struct inode* inode) {
     file->inode = inode;
     file->pos = 0;
     file->deny_write = false;
+    file->ref_count = 1;
+    lock_init(&file->ref_lock);
     return file;
   } else {
     inode_close(inode);
@@ -33,12 +38,29 @@ struct file* file_reopen(struct file* file) {
   return file_open(inode_reopen(file->inode));
 }
 
+/* Returns another reference to FILE, sharing its current position. */
+struct file* file_duplicate(struct file* file) {
+  if (file != NULL) {
+    lock_acquire(&file->ref_lock);
+    file->ref_count++;
+    lock_release(&file->ref_lock);
+  }
+  return file;
+}
+
 /* Closes FILE. */
 void file_close(struct file* file) {
   if (file != NULL) {
-    file_allow_write(file);
-    inode_close(file->inode);
-    free(file);
+    bool last;
+    lock_acquire(&file->ref_lock);
+    ASSERT(file->ref_count > 0);
+    last = --file->ref_count == 0;
+    lock_release(&file->ref_lock);
+    if (last) {
+      file_allow_write(file);
+      inode_close(file->inode);
+      free(file);
+    }
   }
 }
 

@@ -7,7 +7,9 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
+
 #include "filesys/directory.h"
 #include "filesys/file.h"
 #include "filesys/filesys.h"
@@ -16,6 +18,7 @@
 #include "threads/interrupt.h"
 #include "threads/malloc.h"
 #include "threads/palloc.h"
+#include "threads/pte.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
@@ -25,7 +28,8 @@ static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(char *file_name, void (**eip)(void), void **esp);
 bool setup_thread(void (**eip)(void), void** esp);
-
+static bool copy_page_table(uint32_t* child_pagedir, uint32_t* parent_pagedir);
+static void start_fork(void*);
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
    the first user process. Any additions to the PCB should be also
@@ -130,7 +134,7 @@ static void start_process(void* aux) {
   bool success, pcb_success;
   child->load_success = false;
   /* Allocate process control block */
-  struct process* new_pcb = malloc(sizeof(struct process));
+  struct process* new_pcb = calloc(sizeof(struct process),1);
   
   success = pcb_success = new_pcb != NULL;
   /* Initialize process control block */
@@ -271,6 +275,18 @@ void process_exit(void) {
   printf("%s: exit(%d)\n",
        cur->pcb->process_name,
        cur->pcb->exit_status);
+  if (cur->pcb->executable != NULL) {
+        file_close(cur->pcb->executable);
+        cur->pcb->executable = NULL;
+      } 
+  for (int fd = 2; fd < FD_MAX; fd++) {
+    if (cur->pcb->fd_table[fd] != NULL) {
+          lock_acquire(&filesys_lock);
+          file_close(cur->pcb->fd_table[fd]);
+          lock_release(&filesys_lock);
+          cur->pcb->fd_table[fd] = NULL;
+        }
+      }        
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pcb->pagedir;
@@ -426,7 +442,9 @@ bool load(char *file_name, void (**eip)(void), void** esp) {
   }
   
   argv[argc] = NULL;
+  lock_acquire(&filesys_lock);
   file = filesys_open(argv[0]);
+  lock_release(&filesys_lock);
   if (file == NULL) {
     printf("load: %s: open failed\n", file_name);
     goto done;
@@ -498,10 +516,13 @@ bool load(char *file_name, void (**eip)(void), void** esp) {
   *eip = (void (*)(void))ehdr.e_entry;
 
   success = true;
+  file_deny_write(file);
+  t->pcb->executable = file;
 
 done:
   /* We arrive here whether the load is successful or not. */
-  file_close(file);
+  if(!success)
+    file_close(file);
   return success;
 }
 
@@ -684,7 +705,127 @@ char **argv_user = (char **) *esp;
   }
   return success;
 }
+pid_t process_fork(struct intr_frame* if_) {
+  tid_t tid;
+  struct process* parent = thread_current()->pcb;
+  if (parent == NULL)
+    return -1;
 
+  struct process_status* child_status = malloc(sizeof *child_status);
+  if (child_status == NULL)
+    return -1;
+
+  child_status->pid = -1;
+  child_status->ref_count = 2;
+  child_status->exit_status = -1;
+  child_status->waited = false;
+  sema_init(&child_status->wait_done, 0);
+  lock_init(&child_status->ref_lock);
+
+  struct fork_info* fork_info = malloc(sizeof *fork_info);
+  if (fork_info == NULL) {
+    free(child_status);
+    return -1;
+  }
+  fork_info->if_ = *if_;
+  fork_info->if_.eax = 0;
+  fork_info->process_status = child_status;
+  fork_info->success = false;
+  sema_init(&fork_info->done, 0);
+  fork_info->parent = parent;
+
+  tid = thread_create(parent->process_name, PRI_DEFAULT, start_fork, fork_info);
+  if (tid == TID_ERROR) {
+    free(child_status);
+    free(fork_info);
+    return -1;
+  }
+
+  sema_down(&fork_info->done);
+  if (!fork_info->success) {
+    free(child_status);
+    free(fork_info);
+    return -1;
+  }
+  child_status->pid = tid;
+  list_push_back(&parent->children, &child_status->elem);
+  free(fork_info);
+  return tid;
+}
+
+ 
+static void start_fork(void* aux) {
+  struct fork_info* info = aux;
+  struct thread* t = thread_current();
+  struct process* parent = info->parent;
+  struct intr_frame if_;
+  bool success = false;
+  struct process* new_pcb = calloc(1, sizeof *new_pcb);
+  if (new_pcb == NULL)
+    goto done;
+
+  info->success = false;
+  new_pcb->pagedir = NULL;
+  t->pcb = new_pcb;
+  new_pcb->main_thread = t;
+  strlcpy(new_pcb->process_name, parent->process_name, sizeof new_pcb->process_name);
+  list_init(&new_pcb->children);
+  new_pcb->parent_status = info->process_status;
+  new_pcb->exit_status = -1;
+
+  new_pcb->pagedir = pagedir_create();
+  if (new_pcb->pagedir == NULL ||
+      !copy_page_table(new_pcb->pagedir, parent->pagedir))
+    goto done;
+
+  lock_acquire(&filesys_lock);
+  for (int fd = 2; fd < FD_MAX; fd++)
+    new_pcb->fd_table[fd] = file_duplicate(parent->fd_table[fd]);
+  new_pcb->executable = file_duplicate(parent->executable);
+  lock_release(&filesys_lock);
+
+  memcpy(&if_, &info->if_, sizeof if_);
+  success = true;
+  info->success = true;
+  sema_up(&info->done);
+  asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
+  NOT_REACHED();
+
+done:
+  if (!success) {
+    if (new_pcb != NULL) {
+      uint32_t* pd = new_pcb->pagedir;
+      new_pcb->pagedir = NULL;
+      t->pcb = NULL;
+      pagedir_destroy(pd);
+      free(new_pcb);
+    }
+    info->success = false;
+    sema_up(&info->done);
+    thread_exit();
+  }
+}
+
+static bool copy_page_table(uint32_t* child_pagedir, uint32_t* parent_pagedir) {
+  for (uintptr_t address = 0; address < (uintptr_t)PHYS_BASE; address += PGSIZE) {
+    void* upage = (void*)address;
+    void* parent_page = pagedir_get_page(parent_pagedir, upage);
+    if (parent_page != NULL) {
+      uint32_t pde = parent_pagedir[pd_no(upage)];
+      uint32_t pte = pde_get_pt(pde)[pt_no(upage)];
+      void* child_page = palloc_get_page(PAL_USER);
+      if (child_page == NULL)
+        return false;
+
+      memcpy(child_page, parent_page, PGSIZE);
+      if (!pagedir_set_page(child_pagedir, upage, child_page, (pte & PTE_W) != 0)) {
+        palloc_free_page(child_page);
+        return false;
+      }
+    }
+  }
+  return true;
+}
 /* Adds a mapping from user virtual address UPAGE to kernel
    virtual address KPAGE to the page table.
    If WRITABLE is true, the user process may modify the page;
@@ -767,3 +908,4 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+

@@ -4,8 +4,10 @@
 
 #include "threads/thread.h"
 #include <stdint.h>
+#include "threads/interrupt.h"
 
 // At most 8MB can be allocated to the stack
+
 // These defines will be used in Project 2: Multithreading
 #define MAX_STACK_PAGES (1 << 11)
 #define MAX_THREADS 127
@@ -17,6 +19,10 @@ typedef tid_t pid_t;
 /* Thread functions (Project 2: Multithreading) */
 typedef void (*pthread_fun)(void*);
 typedef void (*stub_fun)(pthread_fun, void*);
+
+#include "filesys/file.h"
+#define FD_MAX 128
+
 
 /* The process control block for a given process. Since
    there can be multiple threads per process, we need a separate
@@ -31,8 +37,8 @@ struct process {
   int exit_status;  
   struct process_status* parent_status;
   struct list children;
-
-
+  struct file* fd_table[FD_MAX];
+  struct file* executable;
 };
 
 struct exec_info{
@@ -51,7 +57,13 @@ struct process_status{
     struct list_elem elem;
     struct lock ref_lock;
 };
-
+struct fork_info{
+    struct intr_frame if_;
+    struct process_status* process_status;
+    struct semaphore done;
+    bool success;
+    struct process* parent;
+};
 
 void userprog_init(void);
 
@@ -67,5 +79,6 @@ tid_t pthread_execute(stub_fun, pthread_fun, void*);
 tid_t pthread_join(tid_t);
 void pthread_exit(void);
 void pthread_exit_main(void);
+pid_t process_fork(struct intr_frame*);
 
 #endif /* userprog/process.h */
